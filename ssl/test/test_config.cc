@@ -1305,6 +1305,7 @@ bssl::UniquePtr<SSL_CTX> TestConfig::SetupCtx(SSL_CTX *old_ctx) const {
     return nullptr;
   }
 
+  printf("Starting to add CertCompressionAlg");
   if (install_cert_compression_algs &&
       (!SSL_CTX_add_cert_compression_alg(
            ssl_ctx.get(), 0xff02,

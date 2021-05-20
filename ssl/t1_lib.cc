@@ -3108,6 +3108,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
       ssl_protocol_version(hs->ssl) >= TLS1_3_VERSION) {
     hs->cert_compression_negotiated = true;
     hs->cert_compression_alg_id = ctx->cert_compression_algs[best_index].alg_id;
+    printf("hs->cert_compression_alg_id: %d\n", hs->cert_compression_alg_id);
   }
 
   return true;

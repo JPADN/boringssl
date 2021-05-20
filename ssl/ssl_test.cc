@@ -4594,6 +4594,7 @@ static int XORDecompressFunc(SSL *ssl, CRYPTO_BUFFER **out,
 }
 
 TEST(SSLTest, CertCompression) {
+  printf("ssl_test: CertCompression");
   bssl::UniquePtr<SSL_CTX> client_ctx(SSL_CTX_new(TLS_method()));
   bssl::UniquePtr<SSL_CTX> server_ctx(SSL_CTX_new(TLS_method()));
   ASSERT_TRUE(client_ctx);

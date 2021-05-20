@@ -45,6 +45,7 @@ add_library(
 add_dependencies(ssl global_target)
 
 target_link_libraries(ssl crypto ${LIBOQS})
+target_link_libraries(ssl "${BROTLIDEC_LIBRARIES}" "${BROTLIENC_LIBRARIES}") 
 
 add_executable(
   ssl_test

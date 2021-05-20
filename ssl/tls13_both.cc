@@ -26,6 +26,14 @@
 #include <openssl/stack.h>
 #include <openssl/x509.h>
 
+/* -------------------------------- Modified -------------------------------- */
+
+#include <brotli/encode.h>
+#include <brotli/decode.h>
+#include <openssl/crypto.h>
+
+/* ------------------------------ End modified ------------------------------ */
+
 #include "../crypto/internal.h"
 #include "internal.h"
 
@@ -104,11 +112,286 @@ bool tls13_get_cert_verify_signature_input(
   return true;
 }
 
+/* -------------------------------- Modified -------------------------------- */
+void *cert_brotli_zalloc(void*opaque, size_t size);
+void cert_brotli_zfree(void*opaque, void* addr);
+
+void *cert_brotli_zalloc(void*opaque, size_t size) {
+    return OPENSSL_malloc(size);
+    // TODO aqui deveria ser OPENSSL_zalloc
+}
+
+void cert_brotli_zfree(void*opaque, void* addr) {
+    OPENSSL_free(addr);
+}
+
+
+static size_t tls_cert_compress_brotli(const uint8_t* next_in, size_t avail_in,
+                                       uint8_t* next_out, size_t avail_out, size_t *bytes_compressed) {
+
+/* The values *available_in and *available_out must specify the number of
+bytes addressable at *next_in and *next_out respectively.
+After each call, *available_in will be decremented by the amount of input
+bytes consumed, and the *next_in pointer will be incremented by that
+amount. Similarly, *available_out will be decremented by the amount of
+output bytes written, and the *next_out pointer will be incremented by
+that amount. */
+
+    int ret = 0;
+    size_t in_len = avail_in;
+
+    // Pass this variable to BrotliEncoderCompressStream:
+    // size_t *bytes_compressed3 = (size_t *) malloc();
+    // size_t bytes_compressed3 = 0;
+
+    BrotliEncoderState* state;
+
+    if (next_in == NULL || avail_in == 0) {
+        printf("Next_in null\n");
+        return 0;
+    }
+
+    state = BrotliEncoderCreateInstance(cert_brotli_zalloc, cert_brotli_zfree, NULL);
+    if (!state) {
+        printf("State\n");
+        return 0;
+    }
+
+    // BROTLI_OPERATION_PROCESS : Process input
+    if (!(ret = BrotliEncoderCompressStream(state, BROTLI_OPERATION_PROCESS,
+                                            &avail_in, &next_in, &avail_out, &next_out, NULL))) {
+        printf("Error BrotliEncoderCompressStream\n");
+        return 0;
+        goto err;
+    }
+
+    // printf("bytes_compressed3 inner == %ld\n", bytes_compressed3);
+
+    
+    // Actual finalization is performed when input stream is depleted and there is
+    // enough space in output stream. This means that client should repeat
+    // ::BROTLI_OPERATION_FINISH operation until available_in becomes 0
+
+    do {
+        if (avail_out == 0) {
+            printf("avail_out is zero\n");
+            goto err;
+        }
+        // Finalize the stream.
+        
+        
+        if (!BrotliEncoderCompressStream(state, BROTLI_OPERATION_FINISH,
+                &avail_in, &next_in, &avail_out, &next_out,NULL)) {
+            printf("compress finish\n");
+            return 0;
+            goto err;
+        }
+    } while (!BrotliEncoderIsFinished(state));
+
+    // Helper function ::BrotliEncoderIsFinished checks if stream is finalized and
+    // output fully dumped.
+
+    // Segundo o boringssl esta função deve: "returning one on success and zero on error"
+
+    BrotliEncoderDestroyInstance(state);
+    // return in_len - avail_out;
+    
+    *bytes_compressed = in_len - avail_out;
+
+    printf("in_len == %ld\n", in_len);
+    printf("avail_in == %ld\n", avail_in);
+    printf("avail_out == %ld\n", avail_out);
+    
+    
+    return 1;
+    err:
+        BrotliEncoderDestroyInstance(state);
+        return 0;
+}
+
+
+static size_t tls_cert_uncompress_brotli(const uint8_t* next_in, size_t avail_in, uint8_t* next_out, size_t avail_out)
+{
+    size_t total_out = 0;
+
+    BrotliDecoderState* state;
+    BrotliDecoderResult rest;
+
+    state = BrotliDecoderCreateInstance(cert_brotli_zalloc, cert_brotli_zfree, NULL);
+    if (!state) {
+        return 0;
+    }
+
+    rest = BrotliDecoderDecompressStream(state, &avail_in, &next_in, &avail_out, &next_out, &total_out);
+    if (rest != BROTLI_DECODER_RESULT_SUCCESS) {
+        total_out = 0;
+    }
+
+    BrotliDecoderDestroyInstance(state);
+    return total_out;
+}
+
+/* Devo seguir esta assinatura:
+
+typedef int (*ssl_cert_compression_func_t)(SSL *ssl, CBB *out,
+                                           const uint8_t *in, size_t in_len); */
+
+// OPÇÃO 1
+static int brotli_compress(SSL *ssl, CBB *out, const uint8_t *in, size_t in_len) {
+    
+    printf("brotli_compress\n");
+    size_t avail_out, bytes_compressed;
+    
+    avail_out = in_len;
+    // avail_out = 60000;
+    // avail_out = CBB_len(out);
+    // printf("avail_out == %ld", avail_out);
+
+    // uint8_t *next_out = (uint8_t *) malloc(avail_out);
+    uint8_t *next_out = new uint8_t[avail_out];
+
+    if (!(tls_cert_compress_brotli(in, in_len, next_out, avail_out, &bytes_compressed))) {
+        printf("Error while compressing\n");
+        return 0;
+    }
+
+    printf("bytes_compressed == %ld\n", bytes_compressed);
+
+    if (!CBB_add_bytes(out, next_out, bytes_compressed)) {
+        // Segundo argumento do add_bytes teria que ser const, mas oq passei não é
+        printf("Error while CBB\n");
+        return 0;
+    }
+    
+    // Idealmente teríamos apenas um condicional para ambas funções:
+    // 
+    // if (!tls_cert_compress_brotli(in, in_len, next_out, avail_out, &bytes_compressed) ||
+    //     !CBB_add_bytes(out, next_out, bytes_compressed))
+    //     return 0;
+
+    // TODO: free next_out
+    
+    printf("Finished \n");
+    // Returning one on success and zero on error
+    return 1;
+}
+
+
+// OPÇÃO 2
+
+int CompressBrotliCert(SSL *ssl, CBB *out, const uint8_t *in, size_t in_len) {
+
+    size_t encoded_size = in_len;
+    uint8_t *encoded_buffer = new uint8_t[encoded_size];
+
+    if (!BrotliEncoderCompress(BROTLI_DEFAULT_QUALITY, BROTLI_DEFAULT_WINDOW, BROTLI_DEFAULT_MODE, 
+    in_len, in, &encoded_size, encoded_buffer)) {
+        printf("Error while BrotliEncoderCompress\n");
+        return 0;
+    }
+
+    if (!CBB_init(out, encoded_size)) {
+        printf("Error while CBB_init\n");
+        return 0;
+    }
+
+    if (!CBB_add_bytes(out, encoded_buffer, encoded_size)) {
+        // Segundo argumento do add_bytes teria que ser const, mas oq passei não é
+        printf("Error while CBB_add_bytes\n");
+        return 0;
+    }
+    return 1;
+}
+
+
+
+/* Devo seguir esta assinatura:
+
+typedef int (*ssl_cert_decompression_func_t)(SSL *ssl, CRYPTO_BUFFER **out,
+                                             size_t uncompressed_len,
+                                             const uint8_t *in, size_t in_len); */
+
+
+
+// OPÇÃO 1 
+
+static int brotli_decompress(SSL *ssl, CRYPTO_BUFFER **out, size_t uncompressed_len, const uint8_t *in, size_t in_len) {
+// It returns one on success, in which case |*out| must be set to the result of
+// decompressing |in|, or zero on error
+    
+    printf("brotli_decompress\n");
+
+    printf("uncompressed_len == %ld\n", uncompressed_len);
+    printf("in_len == %ld\n", in_len);
+
+    size_t avail_out = uncompressed_len;
+    uint8_t* next_out = new uint8_t[avail_out];
+    
+
+    size_t bytes_decompressed = tls_cert_uncompress_brotli(in, in_len, next_out, avail_out);
+
+    if ((*out = CRYPTO_BUFFER_new(next_out, bytes_decompressed, NULL)) == NULL) {
+        // Aqui o primeiro argumento devia ser const, mas o que passei não é.
+        printf("CRYPTO_BUFFER_new ERROR\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+// OPÇÃO 2
+
+/* Extraído do código fonte do Chromium */
+int DecompressBrotliCert(SSL* ssl,
+                         CRYPTO_BUFFER** out,
+                         size_t uncompressed_len,
+                         const uint8_t* in,
+                         size_t in_len) {
+  uint8_t* data;
+  bssl::UniquePtr<CRYPTO_BUFFER> decompressed(
+      CRYPTO_BUFFER_alloc(&data, uncompressed_len));
+  if (!decompressed) {
+    return 0;
+  }
+
+  size_t output_size = uncompressed_len;
+  if (BrotliDecoderDecompress(in_len, in, &output_size, data) !=
+          BROTLI_DECODER_RESULT_SUCCESS ||
+      output_size != uncompressed_len) {
+    return 0;
+  }
+
+  *out = decompressed.release();
+  return 1;
+}
+
+/* ------------------------------ End Modified ------------------------------ */
+
+
+
+
+
+
+
+
+
 bool tls13_process_certificate(SSL_HANDSHAKE *hs, const SSLMessage &msg,
                                bool allow_anonymous) {
   SSL *const ssl = hs->ssl;
   CBS body = msg.body;
   bssl::UniquePtr<CRYPTO_BUFFER> decompressed;
+
+/* -------------------------------- Modified -------------------------------- */
+
+//   ssl_cert_compression_func_t compress_ptr = &brotli_compress;
+//   ssl_cert_decompression_func_t decompress_ptr = &brotli_decompress;
+  ssl_cert_compression_func_t compress_ptr = &CompressBrotliCert;
+  ssl_cert_decompression_func_t decompress_ptr = &DecompressBrotliCert;
+
+  if (!SSL_CTX_add_cert_compression_alg(ssl->ctx.get(), 0x2, compress_ptr, decompress_ptr))
+    printf("ERROR: SSL_CTX_add_cert_compression_alg\n");
+
+/* ------------------------------ End modified ------------------------------ */
 
   if (msg.type == SSL3_MT_COMPRESSED_CERTIFICATE) {
     CBS compressed;
@@ -132,9 +415,13 @@ bool tls13_process_certificate(SSL_HANDSHAKE *hs, const SSLMessage &msg,
       return false;
     }
 
+    printf("client: alg_id == %d\n", alg_id);
+    printf("cert_compression_algs.size == %ld\n", ssl->ctx->cert_compression_algs.size());
+
     ssl_cert_decompression_func_t decompress = nullptr;
     for (const auto &alg : ssl->ctx->cert_compression_algs) {
       if (alg.alg_id == alg_id) {
+        printf("Match alg_id\n");
         decompress = alg.decompress;
         break;
       }
@@ -148,6 +435,11 @@ bool tls13_process_certificate(SSL_HANDSHAKE *hs, const SSLMessage &msg,
     }
 
     CRYPTO_BUFFER *decompressed_ptr = nullptr;
+    // A função é responsável por criar o CRYPTO_BUFFER
+    // uncompressed_len já é calculado
+    // in já é fornecido
+    // in_len já é fornecido
+
     if (!decompress(ssl, &decompressed_ptr, uncompressed_len,
                     CBS_data(&compressed), CBS_len(&compressed))) {
       ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_DECODE_ERROR);
@@ -411,6 +703,9 @@ bool tls13_process_finished(SSL_HANDSHAKE *hs, const SSLMessage &msg,
 }
 
 bool tls13_add_certificate(SSL_HANDSHAKE *hs) {
+//   printf("cert_compression_negotiated: %d\n", hs->cert_compression_negotiated);
+//   printf("cert_compression_alg_id: %d\n", hs->cert_compression_alg_id);
+  
   SSL *const ssl = hs->ssl;
   CERT *const cert = hs->config->cert.get();
   DC *const dc = cert->dc.get();
@@ -437,9 +732,12 @@ bool tls13_add_certificate(SSL_HANDSHAKE *hs) {
     return false;
   }
 
+
   if (!ssl_has_certificate(hs)) {
     return ssl_add_message_cbb(ssl, cbb.get());
   }
+
+  // Continuamos apenas se tivermos um certificado e chave privada configurados
 
   CRYPTO_BUFFER *leaf_buf = sk_CRYPTO_BUFFER_value(cert->chain.get(), 0);
   CBB leaf, extensions;
@@ -516,8 +814,52 @@ bool tls13_add_certificate(SSL_HANDSHAKE *hs) {
     return false;
   }
 
+/* -------------------------------- Modified -------------------------------- */
+  
+  // ssl_cert_compression_func_t compress_ptr = &brotli_compress;
+  // ssl_cert_decompression_func_t decompress_ptr = &brotli_decompress;
+  
+  ssl_cert_compression_func_t compress_ptr = &CompressBrotliCert;
+  ssl_cert_decompression_func_t decompress_ptr = &DecompressBrotliCert;
+
+  if (!SSL_CTX_add_cert_compression_alg(ssl->ctx.get(), 0x2, compress_ptr, decompress_ptr))
+    printf("ERROR: SSL_CTX_add_cert_compression_alg\n");
+
+//   SSL_CTX_add_cert_compression_alg(
+//     ssl->ctx.get(), 
+//     0xff02,
+//     [](SSL *ssl_, CBB *out, const uint8_t *in, size_t in_len) -> int {
+//       if (!CBB_add_u8(out, 1) || !CBB_add_u8(out, 2) ||
+//           !CBB_add_u8(out, 3) || !CBB_add_u8(out, 4) ||
+//           !CBB_add_bytes(out, in, in_len)) {
+//         return 0;
+//       }
+//       return 1;
+//     },
+    
+//     [](SSL *ssl_, CRYPTO_BUFFER **out, size_t uncompressed_len,
+//       const uint8_t *in, size_t in_len) -> int {
+//       if (in_len < 4 || in[0] != 1 || in[1] != 2 || in[2] != 3 ||
+//           in[3] != 4 || uncompressed_len != in_len - 4) {
+//         return 0;
+//       }
+//       const bssl::Span<const uint8_t> uncompressed(in + 4, in_len - 4);
+//       *out = CRYPTO_BUFFER_new(uncompressed.data(), uncompressed.size(),
+//                               nullptr);
+//       return 1;
+//     });
+
+//     printf("ctx->cert_compression_algs.size(): %ld\n", ssl->ctx->cert_compression_algs.size());
+
+    hs->cert_compression_alg_id = 0x2;
+
+
+/* ------------------------------ End Modified ------------------------------ */
+
+  
   const CertCompressionAlg *alg = nullptr;
   for (const auto &candidate : ssl->ctx->cert_compression_algs) {
+    printf("candidate.alg_id: %d\n", candidate.alg_id);
     if (candidate.alg_id == hs->cert_compression_alg_id) {
       alg = &candidate;
       break;
@@ -536,6 +878,11 @@ bool tls13_add_certificate(SSL_HANDSHAKE *hs) {
       !CBB_add_u16(body, hs->cert_compression_alg_id) ||
       !CBB_add_u24(body, msg.size()) ||
       !CBB_add_u24_length_prefixed(body, &compressed) ||
+      
+      // CBB *out já é provido
+      // const uint8_t *in já é provido
+      // in_len já é provido
+
       !alg->compress(ssl, &compressed, msg.data(), msg.size()) ||
       !ssl_add_message_cbb(ssl, cbb.get())) {
     OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);

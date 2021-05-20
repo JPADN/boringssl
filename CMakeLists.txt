@@ -35,7 +35,22 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
   find_package(PkgConfig QUIET)
-  if (PkgConfig_FOUND)
+
+# -------------------------------- Modified -------------------------------- #
+    set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    find_package(BrotliDec)
+    if (NOT BROTLIDEC_FOUND)
+        message(FATAL_ERROR "librotlidec is needed to build woff2.")
+    endif ()
+    find_package(BrotliEnc)
+    if (NOT BROTLIENC_FOUND)
+        message(FATAL_ERROR "librotlienc is needed to build woff2.")
+    endif ()
+
+    include_directories("${BROTLIDEC_INCLUDE_DIRS}" "${BROTLIENC_INCLUDE_DIRS}")
+# -------------------------------- End Modified -------------------------------- #
+  
+if (PkgConfig_FOUND)
     pkg_check_modules(LIBUNWIND libunwind-generic)
     if(LIBUNWIND_FOUND)
       add_definitions(-DBORINGSSL_HAVE_LIBUNWIND)

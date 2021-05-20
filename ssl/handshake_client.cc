@@ -281,6 +281,7 @@ static bool ssl_write_client_cipher_list(SSL_HANDSHAKE *hs, CBB *out) {
 }
 
 bool ssl_write_client_hello(SSL_HANDSHAKE *hs) {
+  printf("Clienthello!\n");
   SSL *const ssl = hs->ssl;
   ScopedCBB cbb;
   CBB body;
